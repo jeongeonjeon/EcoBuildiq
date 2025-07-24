@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# VSCode settings
+.vscode/
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data inputs
+data/raw/*
+
+# Data outputs
+data/processed/*
+
+# Model artifacts
+models/*.pkl
+models/*.joblib
+models/*.json
+models/*.pt
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Parquet files
+*.parquet
+
+# Environment / secrets
+.env
+config/db_config.yaml
+
+
+
