@@ -1,4 +1,3 @@
-# server/db.py
 import yaml
 import psycopg2
 from pathlib import Path
