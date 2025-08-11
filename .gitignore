@@ -56,3 +56,5 @@ results/*.json
 .env
 config/db_config.yaml
 
+# Maven & Java
+server/target/*
