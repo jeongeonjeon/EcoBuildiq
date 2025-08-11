@@ -33,11 +33,21 @@ models/*.pkl
 models/*.joblib
 models/*.json
 models/*.pt
+models/*.pth
+models/*.png
+notebooks/models/*
+
+# Results
+results/*.png
+results/*.csv
+results/*.json
 
 # Logs and temporary files
 *.log
 *.tmp
 *.bak
+*.out
+*.err
 
 # Parquet files
 *.parquet
@@ -45,6 +55,4 @@ models/*.pt
 # Environment / secrets
 .env
 config/db_config.yaml
-
-
 

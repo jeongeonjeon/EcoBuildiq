@@ -7,7 +7,7 @@ DATA_DIR = Path("data/processed")
 MODEL_DIR = Path("models")
 
 def load_data():
-    print("Loading processed data...")
+    print("Loading processed data")
     df = pd.read_parquet(DATA_DIR / "office_data.parquet")
 
     features = ['square_feet', 'year_built', 'air_temperature', 'dew_temperature', 'hour', 'weekday']
@@ -16,7 +16,7 @@ def load_data():
     return X, original_index, df
 
 def load_model():
-    print("Loading trained model...")
+    print("Loading trained model")
     model = joblib.load(MODEL_DIR / "ridge_model.pkl")
     return model
 
@@ -24,7 +24,7 @@ def run_inference():
     X, index, full_df = load_data()
     model = load_model()
 
-    print("Running prediction...")
+    print("Running prediction")
     y_pred = model.predict(X)
 
     # 음수 예측값 제거 (0으로 클리핑)
