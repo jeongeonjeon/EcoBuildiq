@@ -8,17 +8,20 @@ from tqdm import tqdm
 import os
 import math
 import json
+from datetime import datetime, timedelta
 
 # Config (학습과 동일하게)
-input_size = 13
+# input_size = 13  # CHANGED: 자동 감지로 대체
 output_size = 1
 hidden_size = 64
 num_layers = 2
 dropout = 0.2
-batch_size = 256  # 128->256 변경(128~512)
+batch_size = 256
 target_index = 0
 
-device = torch.device("cpu")
+# CHANGED: GPU 여부에 따라 pin_memory 설정 및 device 선택
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PIN_MEMORY = (device.type == "cuda")
 
 # Paths
 X_DIR = Path("data/processed")
@@ -27,8 +30,18 @@ MODEL_PATH = Path("models/lstm_model_all.pth")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 PRED_CSV = RESULTS_DIR / "preds_all.csv"
+POLICY_CSV = RESULTS_DIR / "policy_events_ready.csv"
 METRICS_CSV = RESULTS_DIR / "metrics_per_meter.csv"
 
+# Time synthesis for timestamps
+START_TIME = datetime.utcnow()
+STEP_MINUTES = 1
+
+# Zone mapping
+DEFAULT_ZONE = "default"
+METER_ZONE_DEFAULTS = {
+    # "electricity": "office_3f",
+}
 
 # Utilities
 def available_meter_types(x_dir: Path, y_dir: Path, all_types):
@@ -46,7 +59,14 @@ ALL_TYPES = ["electricity", "chilledwater", "steam", "hotwater", "gas", "water",
 METER_TYPES = available_meter_types(X_DIR, Y_DIR, ALL_TYPES)
 print(f"Using meter types: {METER_TYPES}")
 
-# Model (학습과 동일)
+# CHANGED: input_size 자동 감지 (첫 가용 X에서)
+if len(METER_TYPES) == 0:
+    raise RuntimeError("No meter types found.")
+_sample = np.load(X_DIR / f"X_lstm_{METER_TYPES[0]}.npy", mmap_mode="r")
+input_size = _sample.shape[-1]
+print(f"Detected input_size = {input_size}")
+
+# Model
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
         super().__init__()
@@ -62,9 +82,8 @@ class NPYDatasetInfer(Dataset):
     def __init__(self, meter_types, x_dir: Path, y_dir: Path, target_index=0):
         self.meter_types = meter_types
         self.X_data = [np.load(x_dir / f"X_lstm_{m}.npy", mmap_mode="r") for m in meter_types]
-        self.y_data = [np.load(y_dir / f"y_lstm_{m}.npy", mmap_mode="r") for m in meter_types]
+        self.y_data = [np.load(y_dir / f"y_lstm_{m}.npy", mmap_mode="r") for m in meter_types]  # log1p 공간 저장
         self.target_index = target_index
-        # (meter_idx, sample_idx)
         self.indices = [(mi, sj) for mi, x in enumerate(self.X_data) for sj in range(len(x))]
 
     def __len__(self):
@@ -73,8 +92,8 @@ class NPYDatasetInfer(Dataset):
     def __getitem__(self, idx):
         mi, sj = self.indices[idx]
         x = torch.tensor(self.X_data[mi][sj], dtype=torch.float32)
-        y = torch.tensor(self.y_data[mi][sj][self.target_index], dtype=torch.float32)
-        return x, y.unsqueeze(0), mi, sj  # (B, T, F), (B,1), meter_idx, seq_idx
+        y = torch.tensor(self.y_data[mi][sj][self.target_index], dtype=torch.float32)  # log1p(y)
+        return x, y.unsqueeze(0), mi, sj
 
 # Load data/model
 dataset = NPYDatasetInfer(METER_TYPES, X_DIR, Y_DIR, target_index=target_index)
@@ -82,11 +101,11 @@ num_workers = max(os.cpu_count() // 2, 0)
 loader = DataLoader(
     dataset,
     batch_size=batch_size,
-    shuffle=False,            # 추론은 순서 고정
-    num_workers=num_workers,            # 재현성/안정성
+    shuffle=False,
+    num_workers=num_workers,
     persistent_workers=(num_workers > 0),
     prefetch_factor=(4 if num_workers > 0 else None),
-    pin_memory=False
+    pin_memory=PIN_MEMORY,  # CHANGED
 )
 
 if not MODEL_PATH.exists():
@@ -97,93 +116,118 @@ state = torch.load(MODEL_PATH, map_location=device)
 model.load_state_dict(state, strict=True)
 model.eval()
 
-METER_STATS = []  # list of dicts with mean/std per meter
+# CHANGED: 통계는 로그공간(mean_log,std_log) + 원 단위(mean_lin,std_lin)도 함께 보관
+METER_STATS = []
 METER_COUNTS = []
 for m in METER_TYPES:
-
-    y_arr = np.load(Y_DIR / f"y_lstm_{m}.npy", mmap_mode="r")[:, target_index]
-    mu = float(np.mean(y_arr))
-    sd = float(np.std(y_arr) + 1e-12)  # avoid zero
-
-    METER_STATS.append({"mean": mu, "std": sd})
-    METER_COUNTS.append(len(y_arr))
+    y_log = np.load(Y_DIR / f"y_lstm_{m}.npy", mmap_mode="r")[:, target_index]
+    mu_log = float(np.mean(y_log))
+    sd_log = float(np.std(y_log) + 1e-12)
+    y_lin = np.expm1(y_log)  # 원 단위로 복원
+    mu_lin = float(np.mean(y_lin))
+    sd_lin = float(np.std(y_lin) + 1e-12)
+    METER_STATS.append({"mean_log": mu_log, "std_log": sd_log, "mean_lin": mu_lin, "std_lin": sd_lin})
+    METER_COUNTS.append(len(y_log))
 
 N_total = sum(METER_COUNTS)
-overall_mean = (
-    sum(METER_STATS[i]["mean"] * METER_COUNTS[i] for i in range(len(METER_TYPES))) / max(N_total, 1)
+overall_mean_lin = (
+    sum(METER_STATS[i]["mean_lin"] * METER_COUNTS[i] for i in range(len(METER_TYPES))) / max(N_total, 1)
 )
 
-# Inference + Metrics
+# Inference + Metrics (원 단위로 산출)
 overall_mse_sum = 0.0
 overall_mae_sum = 0.0
 overall_sst = 0.0
 overall_n = 0
 
-# per-meter 누적
 per_meter = {
-    i: {"name": METER_TYPES[i], "mse_sum": 0.0, "mae_sum": 0.0,"sse": 0.0,"sst": 0.0, "n": 0}
+    i: {"name": METER_TYPES[i], "mse_sum": 0.0, "mae_sum": 0.0, "sse": 0.0, "sst": 0.0, "n": 0}
     for i in range(len(METER_TYPES))
 }
 
-# preds csv 작성
-with open(PRED_CSV, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["meter_type", "seq_index", "y_true", "y_pred"])
+# Writers
+pred_file = open(PRED_CSV, "w", newline="")
+pred_writer = csv.writer(pred_file)
+pred_writer.writerow(["meter_type", "seq_index", "y_true", "y_pred"])
 
-    with torch.inference_mode():
-        for X, y, mi, sj in tqdm(loader, desc="Batches"):
-            X = X.to(device)
-            pred = model(X).cpu().squeeze(1)   # (B,)
-            y = y.cpu().squeeze(1)             # (B,)
-            
-            # 학습에서 y를 z-score로 썼다면, 여기서 역변환
-            Y_STANDARDIZED = True  # <- 학습에서 표준화 적용했으니 True
+policy_file = open(POLICY_CSV, "w", newline="")
+policy_writer = csv.writer(policy_file)
+policy_writer.writerow(["timestamp", "zone_id", "meter_type", "value", "indoor_temperature_pred", "occupancy_pred", "horizon"])
 
-            if Y_STANDARDIZED:
-                pred_raw = pred.clone()
-                for k in range(len(mi)):
-                    idx = int(mi[k].item())
-                    mu = METER_STATS[idx]["mean"]
-                    sd = METER_STATS[idx]["std"]
-                    pred_raw[k] = pred[k] * sd + mu
-                pred = pred_raw  # 이후 err/CSV는 pred 기준
+Y_STANDARDIZED = True  # 학습 시 y를 로그공간에서 z-score 표준화했음
 
-            # 누적 (overall)
-            err = pred - y
-            overall_mse_sum += (err ** 2).sum().item()
-            overall_mae_sum += err.abs().sum().item()
-            overall_sst += ((y - overall_mean) ** 2).sum().item()
-            overall_n += y.numel()
+with torch.inference_mode():
+    for X, y_log, mi, sj in tqdm(loader, desc="Batches"):
+        X = X.to(device)
+        pred_z = model(X).cpu().squeeze(1)   # (B,) in z-score (log space)
+        y_log = y_log.cpu().squeeze(1)       # (B,) in log space
 
-            # 누적 (per-meter)
+        # inverse standardization (log space)
+        if Y_STANDARDIZED:
+            pred_log = pred_z.clone()
             for k in range(len(mi)):
                 idx = int(mi[k].item())
-                mu = METER_STATS[idx]["mean"]
-                e2 = float((pred[k] - y[k]) ** 2)
-                ae = float(abs(pred[k] - y[k]))
-                per_meter[idx]["mse_sum"] += e2
-                per_meter[idx]["mae_sum"] += ae
-                per_meter[idx]["sse"] += e2
-                per_meter[idx]["sst"] += float((y[k] - mu) ** 2)
-                per_meter[idx]["n"] += 1
+                mu = METER_STATS[idx]["mean_log"]
+                sd = METER_STATS[idx]["std_log"]
+                pred_log[k] = pred_z[k] * sd + mu
+        else:
+            pred_log = pred_z
 
-            # CSV 라인 기록
-            for k in range(len(mi)):
-                writer.writerow([
-                    METER_TYPES[int(mi[k].item())],
-                    int(sj[k].item()),
-                    float(y[k].item()),
-                    float(pred[k].item())
-                ])
+        # CHANGED: log→linear 복원 후, 원 단위에서 지표/CSV/PolicyEvents 계산
+        y_lin = np.expm1(y_log.numpy())
+        pred_lin = np.expm1(pred_log.numpy())
 
-# 결과 출력/저장
+        # (옵션) 물리적 제약 clip (필요 시 주석 해제)
+        # for k in range(len(mi)):
+        #     mt = METER_TYPES[int(mi[k].item())]
+        #     if mt in ["electricity", "chilledwater", "steam", "hotwater", "gas", "water", "irrigation"]:
+        #         pred_lin[k] = max(pred_lin[k], 0.0)
+
+        # metrics accumulators (linear)
+        err = pred_lin - y_lin
+        overall_mse_sum += float((err ** 2).sum())
+        overall_mae_sum += float(np.abs(err).sum())
+        overall_sst += float(((y_lin - overall_mean_lin) ** 2).sum())
+        overall_n += y_lin.size
+
+        for k in range(len(mi)):
+            idx = int(mi[k].item())
+            mu_lin = METER_STATS[idx]["mean_lin"]
+            e2 = float((pred_lin[k] - y_lin[k]) ** 2)
+            ae = float(abs(pred_lin[k] - y_lin[k]))
+            per_meter[idx]["mse_sum"] += e2
+            per_meter[idx]["mae_sum"] += ae
+            per_meter[idx]["sse"] += e2
+            per_meter[idx]["sst"] += float((y_lin[k] - mu_lin) ** 2)
+            per_meter[idx]["n"] += 1
+
+        # write CSVs (linear)
+        for k in range(len(mi)):
+            meter_type = METER_TYPES[int(mi[k].item())]
+            seq_index = int(sj[k].item())
+            y_true_val = float(y_lin[k])
+            y_pred_val = float(pred_lin[k])
+
+            pred_writer.writerow([meter_type, seq_index, y_true_val, y_pred_val])
+
+            ts_val = (START_TIME + timedelta(minutes=seq_index * STEP_MINUTES)).isoformat() + "Z"
+            zone_id = METER_ZONE_DEFAULTS.get(meter_type, DEFAULT_ZONE)
+            horizon = seq_index * STEP_MINUTES
+            policy_writer.writerow([ts_val, zone_id, meter_type, y_pred_val, "", "", horizon])
+
+# close files
+pred_file.close()
+policy_file.close()
+
+# Final metrics (linear)
 overall_mse = overall_mse_sum / max(overall_n, 1)
 overall_rmse = math.sqrt(overall_mse)
 overall_mae = overall_mae_sum / max(overall_n, 1)
 overall_r2 = 1.0 - (overall_mse_sum / max(overall_sst, 1e-12))
 
 print(f"OVERALL  MSE:{overall_mse:.6f} | RMSE:{overall_rmse:.6f} | MAE:{overall_mae:.6f} | R2:{overall_r2:.4f}")
-# per-meter CSV
+
+# per-meter metrics csv (linear, NRMSE는 std_lin 사용)
 with open(METRICS_CSV, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["meter_type", "count", "MSE", "RMSE", "MAE", "NRMSE", "R2"])
@@ -195,19 +239,21 @@ with open(METRICS_CSV, "w", newline="") as f:
             mse = per_meter[i]["mse_sum"] / n
             rmse = math.sqrt(mse)
             mae = per_meter[i]["mae_sum"] / n
-            std = METER_STATS[i]["std"]
+            std_lin = METER_STATS[i]["std_lin"]
             sse = per_meter[i]["sse"]
             sst = per_meter[i]["sst"]
-            nrmse = rmse / std
+            nrmse = rmse / (std_lin if std_lin > 0 else float("nan"))
             r2 = 1.0 - (sse / max(sst, 1e-12))
-        writer.writerow([per_meter[i]["name"], n, f"{mse:.6f}", f"{rmse:.6f}", f"{mae:.6f}", f"{nrmse:.6f}", f"{r2:.4f}"])
+        writer.writerow([per_meter[i]["name"], n, f"{mse:.6f}", f"{rmse:.6f}", f"{mae:.6f}", f"{nrmse:.3f}", f"{r2:.4f}"])
         print(f"{per_meter[i]['name']:>12s} | n={n:7d} | RMSE:{rmse:.6f} | MAE:{mae:.6f} | NRMSE:{nrmse:.3f} | R2:{r2:.3f}")
 
 print(f"Predictions saved to: {PRED_CSV}")
+print(f"Policy events saved to: {POLICY_CSV}")
 print(f"Per-meter metrics  : {METRICS_CSV}")
 
-
-(Path(RESULTS_DIR)/"meter_stats.json").write_text(
-    json.dumps([{"meter": m, **s} for m, s in zip(METER_TYPES, METER_STATS)], ensure_ascii=False, indent=2)
+(Path(RESULTS_DIR) / "meter_stats.json").write_text(
+    json.dumps([
+        {"meter": m, **s} for m, s in zip(METER_TYPES, METER_STATS)
+    ], ensure_ascii=False, indent=2)
 )
-print(f"Meter stats saved to: {RESULTS_DIR/'meter_stats.json'}")
+print(f"Meter stats saved to: {RESULTS_DIR / 'meter_stats.json'}")
