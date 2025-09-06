@@ -26,21 +26,23 @@ Thumbs.db
 data/raw/*
 
 # Data outputs
-data/processed/*
+# data/processed/*
 
 # Model artifacts
-models/*.pkl
-models/*.joblib
-models/*.json
-models/*.pt
-models/*.pth
-models/*.png
-notebooks/models/*
+# models/*.pkl
+# models/*.joblib
+# models/*.json
+# models/*.pt
+# models/*.pth
+# models/*.png
+# notebooks/models/*.pth
+# notebooks/models/*.pkl
 
 # Results
-results/*.png
-results/*.csv
-results/*.json
+# results/*.png
+# results/*.csv
+# results/*.json
+# results/*.jsonl
 
 # Logs and temporary files
 *.log
@@ -50,7 +52,7 @@ results/*.json
 *.err
 
 # Parquet files
-*.parquet
+# *.parquet
 
 # Environment / secrets
 .env
