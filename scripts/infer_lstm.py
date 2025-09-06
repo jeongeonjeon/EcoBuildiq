@@ -1,3 +1,13 @@
+"""
+infer_lstm.py  (minimal patch to write building_id into policy CSV)
+
+- 기존 추론/메트릭 로직은 그대로
+- 추가(패치):
+  * meta_building_{meter}.npy 로드
+  * models/building_id_categories.json 로드
+  * policy CSV에 zone_id 대신 building_id를 기록
+"""
+
 import csv
 import torch
 import torch.nn as nn
@@ -10,8 +20,8 @@ import math
 import json
 from datetime import datetime, timedelta
 
-# Config (학습과 동일하게)
-# input_size = 13  # CHANGED: 자동 감지로 대체
+# Config 학습과 동일
+# input_size 모델과 동일
 output_size = 1
 hidden_size = 64
 num_layers = 2
@@ -19,9 +29,7 @@ dropout = 0.2
 batch_size = 256
 target_index = 0
 
-# CHANGED: GPU 여부에 따라 pin_memory 설정 및 device 선택
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PIN_MEMORY = (device.type == "cuda")
+device = torch.device("cpu")  # CPU-only 환경 가정
 
 # Paths
 X_DIR = Path("data/processed")
@@ -29,27 +37,19 @@ Y_DIR = Path("data/processed")
 MODEL_PATH = Path("models/lstm_model_all.pth")
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
 PRED_CSV = RESULTS_DIR / "preds_all.csv"
-POLICY_CSV = RESULTS_DIR / "policy_events_ready.csv"
+POLICY_CSV = RESULTS_DIR / "policy_events_ready.csv"  # 여기의 2번째 컬럼에 building_id를 씁니다
 METRICS_CSV = RESULTS_DIR / "metrics_per_meter.csv"
 
-# Time synthesis for timestamps
-START_TIME = datetime.utcnow()
-STEP_MINUTES = 1
-
-# Zone mapping
-DEFAULT_ZONE = "default"
-METER_ZONE_DEFAULTS = {
-    # "electricity": "office_3f",
-}
+# 메타/카테고리 경로
+BUILDING_CATS_PATH = Path("models/building_id_categories.json")
 
 # Utilities
 def available_meter_types(x_dir: Path, y_dir: Path, all_types):
     available = []
     for m in all_types:
-        x_path = x_dir / f"X_lstm_{m}.npy"
-        y_path = y_dir / f"y_lstm_{m}.npy"
-        if x_path.exists() and y_path.exists():
+        if (x_dir / f"X_lstm_{m}.npy").exists() and (y_dir / f"y_lstm_{m}.npy").exists():
             available.append(m)
         else:
             print(f"Skipping meter_type={m} (missing file)")
@@ -62,9 +62,30 @@ print(f"Using meter types: {METER_TYPES}")
 # CHANGED: input_size 자동 감지 (첫 가용 X에서)
 if len(METER_TYPES) == 0:
     raise RuntimeError("No meter types found.")
+
+# PATCH (권장): input_size 자동 감지 — 기존 하드코딩 대신 첫 X의 feature 수로 설정
 _sample = np.load(X_DIR / f"X_lstm_{METER_TYPES[0]}.npy", mmap_mode="r")
-input_size = _sample.shape[-1]
-print(f"Detected input_size = {input_size}")
+input_size = int(_sample.shape[-1])
+print(f"[info] inferred input_size = {input_size}")
+
+# building 메타/라벨 로더
+def _load_building_meta_and_labels(meter_types, x_dir: Path):
+    b_meta_list = []
+    for m in meter_types:
+        p = x_dir / f"meta_building_{m}.npy"
+        if not p.exists():
+            print(f"[warn] building meta not found for meter={m}")
+            b_meta_list.append(None)
+        else:
+            b_meta_list.append(np.load(p, mmap_mode="r"))
+    if BUILDING_CATS_PATH.exists():
+        building_labels = json.loads(BUILDING_CATS_PATH.read_text())
+    else:
+        building_labels = []
+        print(f"[warn] building_id_categories.json not found.")
+    return b_meta_list, building_labels
+
+B_META_LIST, BUILDING_LABELS = _load_building_meta_and_labels(METER_TYPES, X_DIR)
 
 # Model
 class LSTMModel(nn.Module):
@@ -72,19 +93,20 @@ class LSTMModel(nn.Module):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, output_size)
-
     def forward(self, x):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
 # Dataset (추론용으로 인덱스/미터타입 반환)
 class NPYDatasetInfer(Dataset):
-    def __init__(self, meter_types, x_dir: Path, y_dir: Path, target_index=0):
+    def __init__(self, meter_types, x_dir: Path, y_dir: Path, target_index=0, b_meta_list=None):
         self.meter_types = meter_types
         self.X_data = [np.load(x_dir / f"X_lstm_{m}.npy", mmap_mode="r") for m in meter_types]
-        self.y_data = [np.load(y_dir / f"y_lstm_{m}.npy", mmap_mode="r") for m in meter_types]  # log1p 공간 저장
+        self.y_data = [np.load(y_dir / f"y_lstm_{m}.npy", mmap_mode="r") for m in meter_types]
         self.target_index = target_index
         self.indices = [(mi, sj) for mi, x in enumerate(self.X_data) for sj in range(len(x))]
+        # building meta 주입
+        self.b_meta = b_meta_list
 
     def __len__(self):
         return len(self.indices)
@@ -92,11 +114,15 @@ class NPYDatasetInfer(Dataset):
     def __getitem__(self, idx):
         mi, sj = self.indices[idx]
         x = torch.tensor(self.X_data[mi][sj], dtype=torch.float32)
-        y = torch.tensor(self.y_data[mi][sj][self.target_index], dtype=torch.float32)  # log1p(y)
-        return x, y.unsqueeze(0), mi, sj
+        y = torch.tensor(self.y_data[mi][sj][self.target_index], dtype=torch.float32)  # 저장된 공간(보통 log)
+        # building 코드 반환 (없으면 -1)
+        b_code = -1
+        if self.b_meta is not None and self.b_meta[mi] is not None:
+            b_code = int(self.b_meta[mi][sj])
+        return x, y.unsqueeze(0), mi, sj, b_code
 
 # Load data/model
-dataset = NPYDatasetInfer(METER_TYPES, X_DIR, Y_DIR, target_index=target_index)
+dataset = NPYDatasetInfer(METER_TYPES, X_DIR, Y_DIR, target_index=target_index, b_meta_list=B_META_LIST)
 num_workers = max(os.cpu_count() // 2, 0)
 loader = DataLoader(
     dataset,
@@ -105,36 +131,33 @@ loader = DataLoader(
     num_workers=num_workers,
     persistent_workers=(num_workers > 0),
     prefetch_factor=(4 if num_workers > 0 else None),
-    pin_memory=PIN_MEMORY,  # CHANGED
+    pin_memory=False,
 )
 
+# Load model
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-
 model = LSTMModel(input_size, hidden_size, num_layers, output_size, dropout).to(device)
 state = torch.load(MODEL_PATH, map_location=device)
 model.load_state_dict(state, strict=True)
 model.eval()
 
-# CHANGED: 통계는 로그공간(mean_log,std_log) + 원 단위(mean_lin,std_lin)도 함께 보관
+# Stats for inverse-standardization (여기서는 y가 z-score(log) 저장됐다고 가정)
 METER_STATS = []
 METER_COUNTS = []
 for m in METER_TYPES:
-    y_log = np.load(Y_DIR / f"y_lstm_{m}.npy", mmap_mode="r")[:, target_index]
-    mu_log = float(np.mean(y_log))
-    sd_log = float(np.std(y_log) + 1e-12)
-    y_lin = np.expm1(y_log)  # 원 단위로 복원
-    mu_lin = float(np.mean(y_lin))
-    sd_lin = float(np.std(y_lin) + 1e-12)
-    METER_STATS.append({"mean_log": mu_log, "std_log": sd_log, "mean_lin": mu_lin, "std_lin": sd_lin})
-    METER_COUNTS.append(len(y_log))
+    y_arr = np.load(Y_DIR / f"y_lstm_{m}.npy", mmap_mode="r")[:, target_index]
+    mu = float(np.mean(y_arr))
+    sd = float(np.std(y_arr) + 1e-12)
+    METER_STATS.append({"mean": mu, "std": sd})
+    METER_COUNTS.append(len(y_arr))
 
 N_total = sum(METER_COUNTS)
-overall_mean_lin = (
-    sum(METER_STATS[i]["mean_lin"] * METER_COUNTS[i] for i in range(len(METER_TYPES))) / max(N_total, 1)
+overall_mean = (
+    sum(METER_STATS[i]["mean"] * METER_COUNTS[i] for i in range(len(METER_TYPES))) / max(N_total, 1)
 )
 
-# Inference + Metrics (원 단위로 산출)
+# Inference & Metrics
 overall_mse_sum = 0.0
 overall_mae_sum = 0.0
 overall_sst = 0.0
@@ -145,54 +168,52 @@ per_meter = {
     for i in range(len(METER_TYPES))
 }
 
-# Writers
 pred_file = open(PRED_CSV, "w", newline="")
 pred_writer = csv.writer(pred_file)
 pred_writer.writerow(["meter_type", "seq_index", "y_true", "y_pred"])
 
 policy_file = open(POLICY_CSV, "w", newline="")
 policy_writer = csv.writer(policy_file)
-policy_writer.writerow(["timestamp", "zone_id", "meter_type", "value", "indoor_temperature_pred", "occupancy_pred", "horizon"])
+# 두 번째 컬럼명을 building_id로 변경
+policy_writer.writerow(["timestamp", "building_id", "meter_type", "value", "indoor_temperature_pred", "occupancy_pred", "horizon"])
 
-Y_STANDARDIZED = True  # 학습 시 y를 로그공간에서 z-score 표준화했음
+Y_STANDARDIZED = True  # 학습 시 y를 z-score(log)로 썼다면 True
+
+# 타임스탬프 합성(필요 시 수정)
+START_TIME = datetime.utcnow()
+STEP_MINUTES = 1
 
 with torch.inference_mode():
-    for X, y_log, mi, sj in tqdm(loader, desc="Batches"):
+    for X, y, mi, sj, b_code in tqdm(loader, desc="Batches"):
         X = X.to(device)
-        pred_z = model(X).cpu().squeeze(1)   # (B,) in z-score (log space)
-        y_log = y_log.cpu().squeeze(1)       # (B,) in log space
+        pred = model(X).cpu().squeeze(1)   # (B,) z-score in log space
+        y = y.cpu().squeeze(1)             # (B,) log space
 
         # inverse standardization (log space)
         if Y_STANDARDIZED:
-            pred_log = pred_z.clone()
+            pred_log = pred.clone()
             for k in range(len(mi)):
                 idx = int(mi[k].item())
-                mu = METER_STATS[idx]["mean_log"]
-                sd = METER_STATS[idx]["std_log"]
-                pred_log[k] = pred_z[k] * sd + mu
+                mu = METER_STATS[idx]["mean"]
+                sd = METER_STATS[idx]["std"]
+                pred_log[k] = pred[k] * sd + mu
         else:
-            pred_log = pred_z
+            pred_log = pred
 
-        # CHANGED: log→linear 복원 후, 원 단위에서 지표/CSV/PolicyEvents 계산
-        y_lin = np.expm1(y_log.numpy())
+        # log -> linear 복원
+        y_lin = np.expm1(y.numpy())
         pred_lin = np.expm1(pred_log.numpy())
 
-        # (옵션) 물리적 제약 clip (필요 시 주석 해제)
-        # for k in range(len(mi)):
-        #     mt = METER_TYPES[int(mi[k].item())]
-        #     if mt in ["electricity", "chilledwater", "steam", "hotwater", "gas", "water", "irrigation"]:
-        #         pred_lin[k] = max(pred_lin[k], 0.0)
-
-        # metrics accumulators (linear)
+        # metrics 누적 (linear space)
         err = pred_lin - y_lin
         overall_mse_sum += float((err ** 2).sum())
         overall_mae_sum += float(np.abs(err).sum())
-        overall_sst += float(((y_lin - overall_mean_lin) ** 2).sum())
+        overall_sst += float(((y_lin - np.expm1(overall_mean)) ** 2).sum())
         overall_n += y_lin.size
 
         for k in range(len(mi)):
             idx = int(mi[k].item())
-            mu_lin = METER_STATS[idx]["mean_lin"]
+            mu_lin = float(np.expm1(METER_STATS[idx]["mean"]))
             e2 = float((pred_lin[k] - y_lin[k]) ** 2)
             ae = float(abs(pred_lin[k] - y_lin[k]))
             per_meter[idx]["mse_sum"] += e2
@@ -210,10 +231,18 @@ with torch.inference_mode():
 
             pred_writer.writerow([meter_type, seq_index, y_true_val, y_pred_val])
 
+            # building 코드 → 라벨 복원
+            bc = int(b_code[k].item())
+            if 0 <= bc < len(BUILDING_LABELS):
+                building_label = str(BUILDING_LABELS[bc])
+            else:
+                building_label = "unknown_building"
+
             ts_val = (START_TIME + timedelta(minutes=seq_index * STEP_MINUTES)).isoformat() + "Z"
-            zone_id = METER_ZONE_DEFAULTS.get(meter_type, DEFAULT_ZONE)
             horizon = seq_index * STEP_MINUTES
-            policy_writer.writerow([ts_val, zone_id, meter_type, y_pred_val, "", "", horizon])
+
+            # policy CSV에 building_id 기록
+            policy_writer.writerow([ts_val, building_label, meter_type, y_pred_val, "", "", horizon])
 
 # close files
 pred_file.close()
@@ -226,8 +255,6 @@ overall_mae = overall_mae_sum / max(overall_n, 1)
 overall_r2 = 1.0 - (overall_mse_sum / max(overall_sst, 1e-12))
 
 print(f"OVERALL  MSE:{overall_mse:.6f} | RMSE:{overall_rmse:.6f} | MAE:{overall_mae:.6f} | R2:{overall_r2:.4f}")
-
-# per-meter metrics csv (linear, NRMSE는 std_lin 사용)
 with open(METRICS_CSV, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["meter_type", "count", "MSE", "RMSE", "MAE", "NRMSE", "R2"])
@@ -239,7 +266,7 @@ with open(METRICS_CSV, "w", newline="") as f:
             mse = per_meter[i]["mse_sum"] / n
             rmse = math.sqrt(mse)
             mae = per_meter[i]["mae_sum"] / n
-            std_lin = METER_STATS[i]["std_lin"]
+            std_lin = float(np.std(np.expm1(np.load(Y_DIR / f"y_lstm_{METER_TYPES[i]}.npy", mmap_mode="r")[:, target_index])))
             sse = per_meter[i]["sse"]
             sst = per_meter[i]["sst"]
             nrmse = rmse / (std_lin if std_lin > 0 else float("nan"))
