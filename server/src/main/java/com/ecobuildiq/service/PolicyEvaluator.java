@@ -18,13 +18,13 @@ import static java.lang.Math.*;
  * - 제어 명령(ControlDecision)을 산출한다.
  *
  * 규칙 카탈로그(우선순위 개념):
- * - R4 (safety): 히터 휴지시간 보호 → 가장 먼저 체크 (우선순위 최상)
  * - R1 (comfort): 점유=1 AND 온도예측 < comfort_min_temp → heater ON
  * - R2 (comfort): 점유=1 AND 온도예측 > comfort_max_temp → cooler ON
  * - R3 (economy): 점유=0 AND 조도>threshold → light OFF
- * - R8 (comfort): 근무 시작 전 프리히트/프리쿨(리드타임 내) → heater/cooler ON
- * - R6 (IAQ): CO₂/RH 임계 초과 → fan ON
+ * - R4 (safety): 히터 휴지시간 보호 → 가장 먼저 체크 (우선순위 최상)
  * - R5 (economy): 근무시간 외 AND 점유=0 → all_devices OFF
+ * - R6 (IAQ): CO₂/RH 임계 초과 → fan ON
+ * - R8 (comfort): 근무 시작 전 프리히트/프리쿨(리드타임 내) → heater/cooler ON //제거
  * - NO_RULE: 위 어느 것도 아니면 현상 유지(또는 NO_ACTION)
  *
  * 주의:
